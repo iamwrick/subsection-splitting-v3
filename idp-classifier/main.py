@@ -13,7 +13,10 @@ from classifier import classify_chunk, consolidate_adjacent_zones, enforce_singl
 from converter import enrich_txt_hints, json_to_text
 from evaluator import compare, format_report, load_ground_truth, summarise
 from models import ChunkResult, DocumentResult, TokenUsage
-from p4_evaluator import evaluate_p4, format_p4_report, summary_to_dict as p4_summary_to_dict
+from p4_evaluator import (
+    evaluate_p4, format_p4_report, summary_to_dict as p4_summary_to_dict,
+    evaluate_p3, format_p3_report, p3_summary_to_dict,
+)
 from reporter import generate_pdf
 
 load_dotenv()
@@ -180,6 +183,7 @@ def classify(
                    f"P4: {package.p4_input_tokens:,}/{package.p4_output_tokens:,} tokens]")
 
         if gt_path:
+            _run_p3_evaluation(pkg_path, gt_path)
             _run_p4_evaluation(pkg_path, gt_path)
 
     if gt_path:
@@ -335,6 +339,7 @@ def batch(
                            f"  → {pkg_path}")
 
                 if has_gt:
+                    _run_p3_evaluation(pkg_path, str(gt_file))
                     _run_p4_evaluation(pkg_path, str(gt_file))
 
             except Exception as exc:
@@ -515,6 +520,20 @@ def _write_eval_json(summary, doc_result: DocumentResult, gt_filename: str, path
         json.dump(data, f, indent=2)
 
 
+def _run_p3_evaluation(full_pipeline_path: str, gt_path: str) -> None:
+    """Run P3 boundary evaluation and write p3_eval.json alongside full_pipeline.json."""
+    try:
+        p3_summary = evaluate_p3(gt_path, full_pipeline_path)
+        click.echo("\n" + format_p3_report(p3_summary))
+        p3_eval_path = full_pipeline_path.replace("full_pipeline.json", "p3_eval.json")
+        Path(p3_eval_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(p3_eval_path, "w", encoding="utf-8") as f:
+            json.dump(p3_summary_to_dict(p3_summary), f, indent=2)
+        click.echo(f"  P3 evaluation saved to {p3_eval_path}")
+    except Exception as exc:
+        click.echo(f"  P3 evaluation ERROR: {exc}", err=True)
+
+
 def _run_p4_evaluation(full_pipeline_path: str, gt_path: str) -> None:
     """Run P4 field evaluation and write p4_eval.json alongside full_pipeline.json."""
     try:
@@ -527,6 +546,23 @@ def _run_p4_evaluation(full_pipeline_path: str, gt_path: str) -> None:
         click.echo(f"  P4 evaluation saved to {p4_eval_path}")
     except Exception as exc:
         click.echo(f"  P4 evaluation ERROR: {exc}", err=True)
+
+
+@cli.command("evaluate-p3")
+@click.option("--full-pipeline", "fp_path", required=True,
+              help="Path to full_pipeline.json from a --full-pipeline run.")
+@click.option("--groundtruth", "gt_path", required=True,
+              help="Path to ground-truth CSV.")
+def evaluate_p3_cmd(fp_path: str, gt_path: str):
+    """Score P3 document-splitting boundary accuracy against ground truth."""
+    p3_summary = evaluate_p3(gt_path, fp_path)
+    click.echo("\n" + format_p3_report(p3_summary))
+    out_path = fp_path.replace("full_pipeline.json", "p3_eval.json")
+    if out_path == fp_path:
+        out_path = os.path.splitext(fp_path)[0] + "_p3_eval.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(p3_summary_to_dict(p3_summary), f, indent=2)
+    click.echo(f"P3 evaluation saved to {out_path}")
 
 
 @cli.command("evaluate-p4")

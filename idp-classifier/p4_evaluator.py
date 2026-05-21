@@ -339,6 +339,155 @@ def format_p4_report(summary: P4EvalSummary) -> str:
     return "\n".join(lines)
 
 
+# ── P3 boundary evaluator ────────────────────────────────────────────────────
+
+@dataclass
+class P3DocResult:
+    doc_index: int
+    gt_pages: str
+    gt_start: int
+    gt_end: int
+    pred_pages: Optional[str]   # None = no overlapping P3 document found
+    pred_start: Optional[int]
+    pred_end: Optional[int]
+    boundary_status: str        # 'exact' | 'off_by_1' | 'off_by_2plus' | 'unmatched'
+
+
+@dataclass
+class P3EvalSummary:
+    input_file: str
+    total_gt_docs: int
+    exact: int
+    off_by_1: int
+    off_by_2plus: int
+    unmatched: int
+    doc_results: list[P3DocResult]
+
+    @property
+    def exact_pct(self) -> float:
+        return 100 * self.exact / self.total_gt_docs if self.total_gt_docs else 0.0
+
+    @property
+    def within_1_pct(self) -> float:
+        return 100 * (self.exact + self.off_by_1) / self.total_gt_docs if self.total_gt_docs else 0.0
+
+
+def _load_all_gt_docs(csv_path: str) -> list[tuple[int, int, int, str]]:
+    """Load ALL document_type rows as (doc_index, start, end, raw_pages)."""
+    rows = {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row["field"].strip() != "document_type":
+                continue
+            idx = int(row["doc_index"])
+            raw = row["pages"].strip()
+            try:
+                start, end = _parse_page_range(raw)
+                rows[idx] = (idx, start, end, raw)
+            except ValueError:
+                pass
+    return [rows[k] for k in sorted(rows)]
+
+
+def evaluate_p3(csv_path: str, full_pipeline_path: str) -> P3EvalSummary:
+    """
+    Score P3 document-splitting boundary accuracy against ground truth.
+
+    For each GT document (from document_type rows), finds the P3-extracted
+    document with the greatest page overlap and classifies the boundary match:
+      exact       — start and end pages both match exactly
+      off_by_1    — max boundary deviation is 1 page
+      off_by_2plus — max boundary deviation is 2+ pages
+      unmatched   — no P3 document overlaps this GT document at all
+    """
+    gt_docs = _load_all_gt_docs(csv_path)
+
+    with open(full_pipeline_path, encoding="utf-8") as f:
+        fp = json.load(f)
+    extracted = fp.get("documents", [])
+    input_file = fp.get("input_file", "")
+
+    exact = off1 = off2 = unmatched = 0
+    doc_results: list[P3DocResult] = []
+
+    for idx, gt_start, gt_end, raw in gt_docs:
+        best = _find_best_doc(gt_start, gt_end, extracted)
+
+        if not best:
+            unmatched += 1
+            doc_results.append(P3DocResult(
+                doc_index=idx, gt_pages=raw,
+                gt_start=gt_start, gt_end=gt_end,
+                pred_pages=None, pred_start=None, pred_end=None,
+                boundary_status="unmatched",
+            ))
+            continue
+
+        ps, pe = best["start_page"], best["end_page"]
+        pred_str = str(ps) if ps == pe else f"{ps}-{pe}"
+        deviation = max(abs(ps - gt_start), abs(pe - gt_end))
+
+        if deviation == 0:
+            status = "exact"; exact += 1
+        elif deviation == 1:
+            status = "off_by_1"; off1 += 1
+        else:
+            status = "off_by_2plus"; off2 += 1
+
+        doc_results.append(P3DocResult(
+            doc_index=idx, gt_pages=raw,
+            gt_start=gt_start, gt_end=gt_end,
+            pred_pages=pred_str, pred_start=ps, pred_end=pe,
+            boundary_status=status,
+        ))
+
+    return P3EvalSummary(
+        input_file=input_file,
+        total_gt_docs=len(gt_docs),
+        exact=exact, off_by_1=off1, off_by_2plus=off2, unmatched=unmatched,
+        doc_results=doc_results,
+    )
+
+
+def format_p3_report(summary: P3EvalSummary) -> str:
+    lines = [
+        "=" * 72,
+        f"  P3 Splitting Evaluation — {summary.input_file}",
+        "=" * 72,
+        f"  GT documents        : {summary.total_gt_docs}",
+        f"  Exact boundary      : {summary.exact:>4}  ({summary.exact_pct:.1f}%)",
+        f"  Off by ≤1 page      : {summary.off_by_1:>4}  ({100*summary.off_by_1/summary.total_gt_docs:.1f}%)" if summary.total_gt_docs else "",
+        f"  Off by 2+ pages     : {summary.off_by_2plus:>4}  ({100*summary.off_by_2plus/summary.total_gt_docs:.1f}%)" if summary.total_gt_docs else "",
+        f"  Unmatched           : {summary.unmatched:>4}  ({100*summary.unmatched/summary.total_gt_docs:.1f}%)" if summary.total_gt_docs else "",
+        f"  Within ≤1 page      : {summary.exact+summary.off_by_1:>4}  ({summary.within_1_pct:.1f}%)",
+        "=" * 72,
+        "",
+    ]
+    return "\n".join(l for l in lines if l is not None)
+
+
+def p3_summary_to_dict(summary: P3EvalSummary) -> dict:
+    return {
+        "input_file": summary.input_file,
+        "total_gt_docs": summary.total_gt_docs,
+        "exact": summary.exact,
+        "off_by_1": summary.off_by_1,
+        "off_by_2plus": summary.off_by_2plus,
+        "unmatched": summary.unmatched,
+        "exact_pct": round(summary.exact_pct, 2),
+        "within_1_pct": round(summary.within_1_pct, 2),
+        "doc_results": [
+            {
+                "doc_index": dr.doc_index,
+                "gt_pages": dr.gt_pages,
+                "pred_pages": dr.pred_pages,
+                "boundary_status": dr.boundary_status,
+            }
+            for dr in summary.doc_results
+        ],
+    }
+
+
 # ── JSON serialiser ───────────────────────────────────────────────────────────
 
 def summary_to_dict(summary: P4EvalSummary) -> dict:
